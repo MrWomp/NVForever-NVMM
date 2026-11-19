@@ -1,74 +1,46 @@
-# NVForever
+# NVMM
 
-An open-source, clean-room reimplementation of the **Fallout: New Vegas** engine, in the
-spirit of OpenMW. It runs on the data files of *your own copy* of the game; it ships no
-Bethesda content and contains no Bethesda or Gamebryo code.
+A fork of [NVForever](https://github.com/LootJunkieAzza/NVForever) where I changed the launcher's Mods page so I could manage mod folders myself.
 
-NVForever is not affiliated with or endorsed by Bethesda Softworks, ZeniMax Media,
-Microsoft or Obsidian Entertainment. See [LEGAL.md](LEGAL.md).
+This is a barebones attempt. It is not the official launcher, and it is not a replacement for Mod Organizer 2. NVForever still runs on the data files of your own copy of Fallout: New Vegas. This fork ships no Bethesda content.
 
-## Getting started
+NVForever is not affiliated with or endorsed by Bethesda Softworks, ZeniMax Media, Microsoft or Obsidian Entertainment.
 
-1. Own and install *Fallout: New Vegas* (base game; DLC optional).
-2. Download a build from the [releases page](https://github.com/LootJunkieAzza/NVForever/releases)
-   and unpack it **outside** the game folder.
-3. Run `nvforever.exe` (or `./nvforever.sh` on Linux) and point it at your game folder
-   when asked.
+## Why this exists
 
-NVForever never writes into the game folder. Its settings, saves and logs live in
-`Documents\My Games\NVForever`.
+I wanted a way to manage mods in the launcher. The Mods page only knew about `plugins.txt`, and a lot of what I use is a folder of loose files, not one plugin dropped in Data. I don't know this codebase, so I had Grok poke at it until it did what I needed on my machine.
 
-Optional: NVIDIA DLSS upscaling on an RTX graphics card (Windows), with files downloaded
-from NVIDIA: see [docs/dlss.md](docs/dlss.md).
+Use whatever is useful and leave the rest.
 
-## Mods
+## What changed
 
-- **Mod Organizer 2:** add `nvforever.exe` to MO2's executables (the drop-down beside
-  **Run**, then **<Edit…>**) and start it from there. It loads the plugins ticked in MO2,
-  in MO2's order, and the game folder MO2 manages. See
-  [docs/mod-organizer-2.md](docs/mod-organizer-2.md).
-- **Without a mod manager:** put the mod in the game's `Data` folder, then turn its plugin
-  on in `Documents\My Games\NVForever\plugins.txt` with a `*` in front of its line. The
-  order of the lines is the load order. NVForever keeps its own list, so the original
-  game's mod list is not changed.
+- The Mods page is split in two. Folders on the left, plugins on the right.
+- Every folder in the launcher's mods folder shows up on the left. Drag a row to change its order. A folder lower in the list overwrites one above it.
+- **Apply** copies that mod's loose files into the mods folder. It skips `.esm` and `.esp` files, so Apply does not turn a plugin on.
+- The plugin list is still the load order. Opening the page looks through the mods once. **Refresh** looks again.
+- A plugin buried inside a mod folder is found, not only one sitting loose in the mods folder.
+- If a plugin is only on another drive, it is linked into the mods folder. Nothing is written into the game's Data folder.
+- Folder names inside NVForever's own folders are matched without caring about capital letters. The game's Data folder is left alone.
+- The bar along the bottom can be dragged shorter. That height is remembered the next time the launcher opens, and the buttons shrink with it.
 
-Script extenders (xNVSE, JIP LN, JohnnyGuitar and several smaller ones) are built into the
-engine: their script functions run without the plugin `.dll` files, which NVForever never
-loads. A mod that needs a plugin's engine patches, or a function not built yet, may not work.
+There is no help text on the page.
 
-## Building from source
+## Using it
 
-Needs [Rust](https://rustup.rs) and Python 3.11+.
+1. Own Fallout: New Vegas and point the launcher at that install, the same way stock NVForever does.
+2. Put each mod in its own folder under the launcher's mods folder. Do not put them in the game's Data folder.
+3. Open **Mods**. The left list is those folders. Drag them into the order you want.
+4. Press **Apply**. Loose files are copied into the mods folder. Plugins are not enabled by this.
+5. On the right, turn on the plugins you actually want and put them in load order.
+6. If you add, remove, or rename a mod folder, press **Refresh**.
 
-```bash
-cd engine
-cargo run --release --bin nvforever -- --data "<path to Fallout New Vegas>/Data"
-```
+A mod that is only a plugin still belongs on the right. Apply is for the folders of meshes, textures, and other loose files.
 
-More: [docs/development.md](docs/development.md) (build, test, options, tools) ·
-[docs/status.md](docs/status.md) (what's built) ·
-[docs/outstanding.md](docs/outstanding.md) (what's left).
+## What it will not do
 
-## Community
-
-Chat, questions and playtesting: [Discord](https://discord.gg/3HsVrsXSb).
-
-## Bugs
-
-Report bugs and differences from the original with the
-[issue forms](https://github.com/LootJunkieAzza/NVForever/issues/new/choose). Crash
-reports are written to `Documents\My Games\NVForever\logs`. Never attach game files.
-
-## Contributing
-
-Pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first: the clean-room
-rules there decide what can be merged.
-
-## Support
-
-NVForever is free. If you'd like to support it: [ko-fi.com/lootjunkieazza](https://ko-fi.com/lootjunkieazza).
-Donations buy nothing extra; you still need your own copy of the game.
-
-## Licence
-
-GPL-3.0-or-later; see [LICENSE](LICENSE) and [LEGAL.md](LEGAL.md#licence).
+- It does not write into the game folder.
+- It does not edit the original game's mod list.
+- Apply does not tick a plugin or change `plugins.txt`.
+- It does not install Mod Organizer 2, and it does not read an MO2 profile.
+- It does not make a mod work if NVForever does not support that mod yet. Script extenders are still whatever upstream has built. This fork does not change the engine's mod support.
+- It is not finished. I use it. I have not run the project's test list or smoke checks.
