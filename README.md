@@ -1,46 +1,43 @@
 # NVMM
 
-A fork of [NVForever](https://github.com/LootJunkieAzza/NVForever) where I changed the launcher's Mods page so I could manage mod folders myself.
+My fork of [NVForever](https://github.com/LootJunkieAzza/NVForever). I mainly changed the launcher's Mods page so I can keep mods in separate folders and see which copy of a file actually gets used.
 
-This is a barebones attempt. It is not the official launcher, and it is not a replacement for Mod Organizer 2. NVForever still runs on the data files of your own copy of Fallout: New Vegas. This fork ships no Bethesda content.
+This isn't the official launcher, and it isn't Mod Organizer 2. NVForever still runs off the data files from your own copy of Fallout: New Vegas. This fork doesn't ship any Bethesda content.
 
 NVForever is not affiliated with or endorsed by Bethesda Softworks, ZeniMax Media, Microsoft or Obsidian Entertainment.
 
 ## Why this exists
 
-I wanted a way to manage mods in the launcher. The Mods page only knew about `plugins.txt`, and a lot of what I use is a folder of loose files, not one plugin dropped in Data. I don't know this codebase, so I had Grok poke at it until it did what I needed on my machine.
+I wanted a Linux mod manager that could handle loose file folders the way I actually use mods, and I plan on this getting more fleshed out into NVForever having its own proper mod manager.
 
-Use whatever is useful and leave the rest.
+## Mods page
 
-## What changed
+Left side is mod folders. Right side is plugins.
 
-- The Mods page is split in two. Folders on the left, plugins on the right.
-- Every folder in the launcher's mods folder shows up on the left. Drag a row to change its order. A folder lower in the list overwrites one above it.
-- **Apply** copies that mod's loose files into the mods folder. It skips `.esm` and `.esp` files, so Apply does not turn a plugin on.
-- The plugin list is still the load order. Opening the page looks through the mods once. **Refresh** looks again.
-- A plugin buried inside a mod folder is found, not only one sitting loose in the mods folder.
-- If a plugin is only on another drive, it is linked into the mods folder. Nothing is written into the game's Data folder.
-- Folder names inside NVForever's own folders are matched without caring about capital letters. The game's Data folder is left alone.
-- The bar along the bottom can be dragged shorter. That height is remembered the next time the launcher opens, and the buttons shrink with it.
+- Put mods in separate folders under NVForever's mods folder. Don't drop those folders into the game's Data folder.
+- Drag a folder to move it. The list goes from top to bottom. The game checks the bottom folder last.
+- Checking a folder turns that folder's plugins on. The number is how many plugins are in the folder. There's no limit.
+- If two checked folders have the same file, the lower folder's copy wins. The higher one's gets skipped.
+- **Show overwrites** shows that under the folder. Green means this mod's copy is the one being used. Red means this mod's copy is skipped. Same result always gets the same color. Hover a note to see the file names.
+- **Find a mod** and **Find a plugin** filter the lists. Click a plugin and its folder gets marked.
+- If a plugin shows up in more than one checked folder, the row tells you which copy is used and which ones are skipped.
+- **Refresh** re-reads the mods folder.
+- **Save** writes NVForever's own `plugins.txt` and `mod-order.txt`. **Undo changes** reloads them. It doesn't touch the original game's mod list.
+- **Apply** saves those same lists. It asks first. It doesn't copy any files — they stay in their folders.
+- **Save backup** stores the folder order and plugin list without changing what the game is currently using. **Max backups kept** controls how many of those it holds. **Load backup** puts one back into the list. **Save** keeps it.
+- **Open mods folder** opens that folder.
+- The new-game start box on this page gets saved to `NVForever.ini`. If Tale of Two Wastelands is in the list, there's a button that fills in its start quest and turns the intro film off.
 
-There is no help text on the page.
-
-## Using it
-
-1. Own Fallout: New Vegas and point the launcher at that install, the same way stock NVForever does.
-2. Put each mod in its own folder under the launcher's mods folder. Do not put them in the game's Data folder.
-3. Open **Mods**. The left list is those folders. Drag them into the order you want.
-4. Press **Apply**. Loose files are copied into the mods folder. Plugins are not enabled by this.
-5. On the right, turn on the plugins you actually want and put them in load order.
-6. If you add, remove, or rename a mod folder, press **Refresh**.
-
-A mod that is only a plugin still belongs on the right. Apply is for the folders of meshes, textures, and other loose files.
+Inside NVForever's own home, two directories whose names only differ by capital letters get joined together. The game's Data folder is never written. Set `NVFOREVER_NO_CASEFOLD` if you want to skip that.
 
 ## What it will not do
 
-- It does not write into the game folder.
-- It does not edit the original game's mod list.
-- Apply does not tick a plugin or change `plugins.txt`.
-- It does not install Mod Organizer 2, and it does not read an MO2 profile.
-- It does not make a mod work if NVForever does not support that mod yet. Script extenders are still whatever upstream has built. This fork does not change the engine's mod support.
-- It is not finished. I use it. I have not run the project's test list or smoke checks.
+- It doesn't write into the game folder.
+- It doesn't edit the original game's mod list.
+- It doesn't install Mod Organizer 2, and it doesn't read an MO2 profile. If you use MO2, just start NVForever from MO2 instead.
+- It doesn't magically make a mod work if NVForever doesn't support it yet. Script extenders are still whatever upstream has.
+- I use this on my machine. I haven't run upstream's test list or smoke checks.
+
+## Building
+
+Needs [Rust](https://rustup.rs). These are two separate builds. The launcher looks for the game next to itself, then falls back to `engine/target/release/nvforever`.
