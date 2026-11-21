@@ -7,7 +7,8 @@
 //!   tab, category and row with its label, note and kind (switch, slider and its steps' words,
 //!   list and its choices). Used while its version and table stamp are the launcher's
 //!   ([`Catalog::from_menu`]; dev builds between releases share a version, the stamp tells
-//!   their tables apart).
+//!   their tables apart). A file from another build still lends its labels and notes onto
+//!   this table, so a Tweaks row is not left as a raw key.
 //! - **Built in** ([`Catalog::built_in`]), before the game has written one (a first start, a
 //!   game older than the file, an update not started yet): the tabs, categories and row order
 //!   from the game's own table (`nvf_settings_layout::SECTIONS`, the crate the game's pause
@@ -49,7 +50,7 @@ pub struct Row {
     /// known (built in, or a file written before it had them).
     pub default: Option<String>,
     /// Built in, with no words in the reference (a Tweaks row): shown only while the INI
-    /// holds it, labelled by its key.
+    /// holds it. The label is words, not the key. The game's menu replaces it.
     pub unlisted: bool,
     /// Shown only while this holds, greyed while one of `needs` does not: the game's rules
     /// (`nvf_settings_layout::shown_with`, `needs`), the same in both sources.
@@ -67,13 +68,17 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// The game's menu beside `ini` when it is this launcher's version and table, else the
-    /// built-in one.
+    /// The game's menu beside `ini` when it is this launcher's version and table. Another
+    /// build's file still supplies the words. No file: the built-in table.
     pub fn load(ini: Option<&Path>) -> Catalog {
-        ini.and_then(|p| std::fs::read_to_string(p.with_file_name(menu::MENU_FILE)).ok())
-            .and_then(|t| Menu::parse(&t))
-            .and_then(|m| Catalog::from_menu(&m, env!("CARGO_PKG_VERSION")))
-            .unwrap_or_else(Catalog::built_in)
+        let parsed = ini.and_then(|p| std::fs::read_to_string(p.with_file_name(menu::MENU_FILE)).ok()).and_then(|t| Menu::parse(&t));
+        let Some(menu) = parsed else {
+            return Catalog::built_in();
+        };
+        if let Some(catalog) = Catalog::from_menu(&menu, env!("CARGO_PKG_VERSION")) {
+            return catalog;
+        }
+        Catalog::built_in().with_game_words(&menu)
     }
 
     /// The game's menu `m`, when it is version `version`'s and of this launcher's table
@@ -133,7 +138,7 @@ impl Catalog {
             for k in s.keys.iter().filter(|k| !k.starts_with(CONTROL_PREFIX)) {
                 let (label, note, unlisted) = match words.get(*k) {
                     Some(w) => (w.label.clone(), w.note.clone(), false),
-                    None => (k.to_string(), String::new(), true),
+                    None => (readable_tweak(k), String::new(), true),
                 };
                 let english = |w: &'static str| w.to_string();
                 let shown_with = nvf_settings_layout::shown_with(k).map(|r| menu::Rule::of(r, english));
@@ -145,10 +150,65 @@ impl Catalog {
         Catalog { tabs, rows, from_game: false }
     }
 
+    /// Keeps this launcher's rows. Copies a label, note, and control from `menu` when the
+    /// key is the same and the label is a real name, not the key.
+    fn with_game_words(mut self, menu: &Menu) -> Self {
+        let words: HashMap<&str, &menu::Row> = menu.rows().map(|r| (r.key.as_str(), r)).collect();
+        for row in &mut self.rows {
+            let Some(game) = words.get(row.key.as_str()) else { continue };
+            let label = game.label.trim();
+            let bare = row.key.strip_prefix("tweak-").unwrap_or(row.key.as_str());
+            if label.is_empty() || label.eq_ignore_ascii_case(&row.key) || label.eq_ignore_ascii_case(bare) {
+                continue;
+            }
+            row.label = game.label.clone();
+            if !game.note.trim().is_empty() {
+                row.note = game.note.clone();
+            }
+            row.kind = Some(game.kind.clone());
+            if !game.default.is_empty() {
+                row.default = Some(game.default.clone());
+            }
+            row.unlisted = false;
+        }
+        for (name, label) in &mut self.tabs {
+            if let Some(tab) = menu.tabs.iter().find(|t| &t.name == name) {
+                if !tab.label.trim().is_empty() {
+                    *label = tab.label.clone();
+                }
+            }
+        }
+        self
+    }
+
     /// The tabs' names, in order.
     pub fn tab_names(&self) -> Vec<String> {
         self.tabs.iter().map(|(n, _)| n.clone()).collect()
     }
+}
+
+/// A Tweaks key the reference does not name, as words. The game's menu file replaces this.
+fn readable_tweak(key: &str) -> String {
+    let bare = key.strip_prefix("tweak-").unwrap_or(key);
+    bare.split('-')
+        .filter(|w| !w.is_empty())
+        .map(|w| match w {
+            "vats" => "V.A.T.S.".to_string(),
+            "npc" => "NPC".to_string(),
+            "hud" => "HUD".to_string(),
+            "dlss" => "DLSS".to_string(),
+            "ai" => "AI".to_string(),
+            "xp" => "XP".to_string(),
+            other => {
+                let mut chars = other.chars();
+                match chars.next() {
+                    Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The rows of `text` (the reference's Markdown): key, label, tab, heading and note.
@@ -225,23 +285,28 @@ pub fn list_choices() -> HashMap<&'static str, &'static [&'static str]> {
         ("vats-style", &["Classic", "Mark and Fire"][..]),
         // As the INI keeps them (`Smoothing::stored`, #2676); the engine also reads its older 1/0.
         ("smooth-terrain", &["off", "2x2", "4x4", "4x4-near"][..]),
+        // ssao.rs `AO_CHOICES` (2026-11-19); the engine also reads its older 1/0.
+        ("ambient-occlusion", &["Off", "Performance", "Quality"][..]),
     ])
 }
 
 /// A list row's value as one of its choices ([`list_choices`]): the older values a list took
 /// over from map to the choice they stand for (the Smooth terrain row's on/off of #2149:
-/// `1`, true, on, yes are `4x4`; `0`, false, off, no are `off`, as the engine reads them);
-/// anything else as it is (trimmed).
+/// `1`, true, on, yes are `4x4`; `0`, false, off, no are `off`; the Ambient occlusion row's
+/// switch of before 2026-11-19: `Quality` and `Off`, as the engine reads them); anything else
+/// as it is (trimmed).
 pub fn list_value(key: &str, value: &str) -> String {
     let v = value.trim();
-    if key == "smooth-terrain" {
-        match v.to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => return "4x4".to_string(),
-            "0" | "false" | "off" | "no" => return "off".to_string(),
-            _ => {}
-        }
+    let (on, off) = match key {
+        "smooth-terrain" => ("4x4", "off"),
+        "ambient-occlusion" => ("Quality", "Off"),
+        _ => return v.to_string(),
+    };
+    match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => on.to_string(),
+        "0" | "false" | "off" | "no" => off.to_string(),
+        _ => v.to_string(),
     }
-    v.to_string()
 }
 
 #[cfg(test)]
@@ -275,14 +340,14 @@ mod tests {
             let row = at(key);
             assert!(!row.unlisted && !row.note.is_empty() && !row.label.is_empty(), "{row:?}");
         }
-        // The Tweaks tab's rows: the game's groups and categories, labelled by key until the
-        // game writes its menu.
+        // A Tweaks row stays unlisted until the game's menu names it. The label is words, not the key.
         assert_eq!(at("dlss-model").shown_with.as_ref().map(|r| r.parent.as_str()), Some("upscaler"), "the game's rules built in too");
         for gone in ["volume-master", "aim-lock", "grass-fire", "god-mode"] {
             assert!(c.rows.iter().all(|r| r.key != gone), "{gone}: its tab is the game's only");
         }
         if let Some(t) = c.rows.iter().find(|r| r.tab == TWEAKS_TAB) {
             assert!(t.unlisted && t.heading.as_deref().is_some_and(|h| h.contains(" › ")), "{t:?}");
+            assert!(!t.label.contains("tweak-") && t.label != t.key, "{t:?}");
         }
     }
 
@@ -385,6 +450,25 @@ mod tests {
     }
 
     #[test]
+    fn a_menu_from_another_build_keeps_this_table_and_uses_the_games_words() {
+        let mut m = game_menu("0.0.1");
+        m.tabs[0].categories[0].rows[0].label = "Hardcore Mode".into();
+        m.tabs[0].categories[0].rows[0].note = "Needs food and sleep.".into();
+        let dir = std::env::temp_dir().join(format!("nvf-launcher-menu-words-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("NVForever.ini");
+        std::fs::write(dir.join(menu::MENU_FILE), m.to_text()).unwrap();
+        let c = Catalog::load(Some(&ini));
+        assert!(!c.from_game, "another build: this launcher's rows");
+        assert_eq!(c.tab_names(), LAUNCHER_TABS);
+        let row = c.rows.iter().find(|r| r.key == "hardcore").unwrap();
+        assert_eq!((row.label.as_str(), row.note.as_str()), ("Hardcore Mode", "Needs food and sleep."));
+        assert!(row.kind.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn list_choices_match_the_engines_names() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../engine/nvf-play/src/");
         for (key, file) in [("kill-camera", "kill_cam.rs"), ("vats-style", "vats_classic.rs"), ("smooth-terrain", "smooth_terrain.rs")] {
@@ -393,10 +477,15 @@ mod tests {
                 assert!(src.contains(&format!("=> \"{name}\"")), "{key}: {name} is no longer a choice in {file}");
             }
         }
+        // The Ambient occlusion row's, as the engine lists them (ssao.rs `AO_CHOICES`).
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../engine/nvforever/src/ssao.rs")).unwrap();
+        let listed = list_choices()["ambient-occlusion"].iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+        assert!(src.contains(&format!("pub const AO_CHOICES: [&str; 3] = [{listed}];")), "ambient-occlusion: the engine's AO_CHOICES are no longer {listed}");
     }
 
-    /// The Smooth terrain row's older on/off reads as its choices (4x4 and off), so a
-    /// launcher with an old INI offers the list, not a switch; other values stay as they are.
+    /// The Smooth terrain row's older on/off reads as its choices (4x4 and off), the Ambient
+    /// occlusion row's as Quality and Off, so a launcher with an old INI offers the list, not
+    /// a switch; other values stay as they are.
     #[test]
     fn older_values_map_to_list_choices() {
         let choices = list_choices();
@@ -404,6 +493,11 @@ mod tests {
             let got = list_value("smooth-terrain", v);
             assert_eq!(got, want, "{v}");
             assert!(choices["smooth-terrain"].contains(&got.as_str()));
+        }
+        for (v, want) in [("1", "Quality"), ("0", "Off"), ("on", "Quality"), ("false", "Off"), ("Performance", "Performance"), (" Quality ", "Quality")] {
+            let got = list_value("ambient-occlusion", v);
+            assert_eq!(got, want, "{v}");
+            assert!(choices["ambient-occlusion"].contains(&got.as_str()));
         }
         assert_eq!(list_value("kill-camera", " 1 "), "1");
     }
