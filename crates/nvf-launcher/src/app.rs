@@ -213,6 +213,8 @@ pub struct App {
     install_source: Option<PathBuf>,
     /// The remembered profile was already loaded this run.
     profile_restored: bool,
+    /// 0 is the load order. 1 is the Saves tab on the right.
+    right_tab: u8,
     /// Used once by the next install, when a dropped archive supplies a mod name.
     install_name: String,
     /// Quick Install is open. Nothing is copied yet.
@@ -253,6 +255,8 @@ pub struct App {
     upd_open: bool,
     // Starting the game.
     newest: Option<NewestSave>,
+    /// Saves in the home, newest first. Continue loads `newest`.
+    saves: Vec<NewestSave>,
     exe: Option<PathBuf>,
     child: Option<Child>,
     /// Test aid: `NVF_LAUNCHER_SHOT=<file.png>[;page]` saves the window once the news has
@@ -436,6 +440,7 @@ impl App {
             root_ask: None,
             install_source: None,
             profile_restored: false,
+            right_tab: 0,
             install_name: String::new(),
             quick: None,
             manual: None,
@@ -465,6 +470,7 @@ impl App {
             upd_cancel: Arc::new(AtomicBool::new(false)),
             upd_open: false,
             newest: None,
+            saves: Vec::new(),
             exe: None,
             child: None,
             shot: std::env::var_os("NVF_LAUNCHER_SHOT").map(|p| (PathBuf::from(p), 0)),
@@ -660,9 +666,10 @@ impl App {
 
     fn find_newest_save(&mut self) {
         let Some(h) = &self.home else { return };
+        let keep = self.newest.as_ref().map(|s| s.path.clone());
         let save_dir = self.profile_saves_dir().unwrap_or_else(|| h.saves());
         let _ = std::fs::create_dir_all(&save_dir);
-        self.newest = fnv_save::list(&save_dir).into_iter().next().map(|(path, hd)| {
+        self.saves = fnv_save::list(&save_dir).into_iter().map(|(path, hd)| {
             let shot = fnv_save::read_header(&path).ok().map(|s| s.shot).filter(|s| !s.is_empty()).map(Arc::from);
             let name = if hd.player_name.is_empty() { path.file_stem().unwrap_or_default().to_string_lossy().into_owned() } else { hd.player_name.clone() };
             let hours = hd.play_seconds / 3600.0;
@@ -671,7 +678,8 @@ impl App {
             parts.push(format!("{hours:.0} h played"));
             let detail = parts.join(" · ");
             NewestSave { path, name, detail, shot }
-        });
+        }).collect();
+        self.newest = keep.and_then(|p| self.saves.iter().find(|s| s.path == p).cloned()).or_else(|| self.saves.first().cloned());
     }
 
     fn fetch_news(&mut self, ctx: &egui::Context) {
@@ -2222,7 +2230,7 @@ impl App {
     }
 
     fn mods_page(&mut self, ui: &mut egui::Ui) {
-        let help = "Left: the profile and the mod list. Right: plugins. Drag a row to change priority. Right-click a mod or a plugin. Drop a folder or an archive on the list to install it. Apply saves the lists. Nothing is copied into Data.";
+        let help = "Left: the profile and the mod list. Right: plugins or saves. Drag a row to change priority. Right-click a mod or a plugin. Drop a folder or an archive on the list to install it. Apply saves the lists. Nothing is copied into Data.";
         ui.horizontal(|ui| {
             let unsaved = self.page_unsaved();
             let heading = match &self.profile_pick {
@@ -2565,6 +2573,21 @@ impl App {
     }
 
     fn plugin_column(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let tabs = [
+                (0u8, "Plugins", "Load order. An ESM should sit above the plugins that need it."),
+                (1, "Saves", "Pick the save Continue uses."),
+            ];
+            for (id, label, tip) in tabs {
+                if ui.selectable_label(self.right_tab == id, label).on_hover_text(tip).clicked() {
+                    self.right_tab = id;
+                }
+            }
+        });
+        if self.right_tab == 1 {
+            self.saves_tab(ui);
+            return;
+        }
         self.backup_row(ui);
         let folders = self.plugin_folders.clone();
         let masters = self.plugin_masters.clone();
@@ -4759,6 +4782,27 @@ impl App {
     }
 
 
+
+    fn saves_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Saves").small().color(GOLD)).on_hover_text("The save Continue uses.");
+        if self.saves.is_empty() {
+            ui.label(RichText::new("No saves found.").small().color(WEAK));
+            return;
+        }
+        let current = self.newest.as_ref().map(|n| n.path.clone());
+        let mut pick = None;
+        egui::ScrollArea::both().id_salt("save-rows").auto_shrink([false, false]).show(ui, |ui| {
+            for (i, save) in self.saves.iter().enumerate() {
+                let on = current.as_ref().is_some_and(|p| p == &save.path);
+                if ui.selectable_label(on, format!("{} · {}", save.name, save.detail)).clicked() {
+                    pick = Some(i);
+                }
+            }
+        });
+        if let Some(i) = pick {
+            self.newest = self.saves.get(i).cloned();
+        }
+    }
 
     fn pick_root(&mut self, index: usize) {
         let Some(ask) = self.root_ask.take() else { return };
