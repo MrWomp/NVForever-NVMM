@@ -100,25 +100,49 @@ pub fn plugins_in_tree(root: &Path) -> Vec<(String, PathBuf)> {
     listed
 }
 
-/// Master file names in the plugin header. Empty when the file is not read.
+/// Master file names in the plugin header. Empty when the file is not read or its header
+/// is compressed: [`read_masters`] tells those apart from a plugin with no masters.
 ///
 /// The record header is 24 bytes [documented: docs/spec-notes/esm.md, "Record header,
 /// 24 bytes"]: type, data size u32, flags u32, FormID u32, version-control u32, form
 /// version u16, version-control u16. The subrecords start after those 24 bytes.
 pub fn master_names(path: &Path) -> Vec<String> {
-    let Ok(mut file) = std::fs::File::open(path) else { return Vec::new() };
+    match read_masters(path) {
+        Masters::Listed(names) => names,
+        Masters::Compressed | Masters::Unreadable => Vec::new(),
+    }
+}
+
+/// What a plugin's header says about its masters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Masters {
+    /// The `MAST` names, in the header's order (none for a plugin without masters).
+    Listed(Vec<String>),
+    /// The header record is compressed (flag `0x00040000`, docs/spec-notes/esm.md), so its
+    /// masters are not read here.
+    Compressed,
+    /// Not a readable plugin header: the file could not be opened, is too short, does not
+    /// start with `TES4`, or holds a master name that is not UTF-8.
+    Unreadable,
+}
+
+/// The masters a plugin's header record lists (`MAST` subrecords, one per master, in order
+/// [documented: docs/spec-notes/esm.md, "TES4"]), reading only the header. The record
+/// header is 24 bytes [documented: docs/spec-notes/esm.md, "Record header, 24 bytes"].
+pub fn read_masters(path: &Path) -> Masters {
+    let Ok(mut file) = std::fs::File::open(path) else { return Masters::Unreadable };
     let mut head = [0u8; 24];
     if std::io::Read::read_exact(&mut file, &mut head).is_err() || &head[0..4] != b"TES4" {
-        return Vec::new();
+        return Masters::Unreadable;
     }
     let size = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
     let flags = u32::from_le_bytes([head[8], head[9], head[10], head[11]]);
     if flags & 0x0004_0000 != 0 {
-        return Vec::new();
+        return Masters::Compressed;
     }
     let mut data = vec![0u8; size.min(1_048_576)];
     if std::io::Read::read_exact(&mut file, &mut data).is_err() {
-        return Vec::new();
+        return Masters::Unreadable;
     }
     let mut i = 0;
     let mut out = Vec::new();
@@ -132,15 +156,15 @@ pub fn master_names(path: &Path) -> Vec<String> {
         if &kind == b"MAST" {
             let raw = &data[i..i + n];
             let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-            if let Ok(name) = std::str::from_utf8(&raw[..end]) {
-                if !name.is_empty() {
-                    out.push(name.to_string());
-                }
+            match std::str::from_utf8(&raw[..end]) {
+                Ok("") => {}
+                Ok(name) => out.push(name.to_string()),
+                Err(_) => return Masters::Unreadable,
             }
         }
         i += n;
     }
-    out
+    Masters::Listed(out)
 }
 
 fn is_esm(name: &str) -> bool {
@@ -848,7 +872,51 @@ Edits.esp
 
 #[cfg(test)]
 mod master_name_tests {
-    use super::master_names;
+    use super::{master_names, read_masters, Masters};
+
+    /// A plugin file: a 24-byte `TES4` header with `flags`, then `MAST` subrecords.
+    fn plugin_bytes(flags: u32, masters: &[&[u8]]) -> Vec<u8> {
+        let mut rec = Vec::new();
+        for raw in masters {
+            rec.extend(b"MAST");
+            rec.extend(&(raw.len() as u16).to_le_bytes());
+            rec.extend(*raw);
+        }
+        let mut file = Vec::new();
+        file.extend(b"TES4");
+        file.extend(&(rec.len() as u32).to_le_bytes());
+        file.extend(&flags.to_le_bytes());
+        file.extend(&0u32.to_le_bytes());
+        file.extend(&0u32.to_le_bytes());
+        file.extend(&0u16.to_le_bytes());
+        file.extend(&0u16.to_le_bytes());
+        file.extend(&rec);
+        file
+    }
+
+    #[test]
+    fn tells_a_compressed_or_unreadable_header_from_no_masters() {
+        let dir = std::env::temp_dir().join(format!("nvf-mast-kinds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: Vec<u8>| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let none = write("none.esp", plugin_bytes(0, &[]));
+        assert_eq!(read_masters(&none), Masters::Listed(Vec::new()));
+        let two = write("two.esp", plugin_bytes(0, &[b"FalloutNV.esm\0", b"DeadMoney.esm\0"]));
+        assert_eq!(read_masters(&two), Masters::Listed(vec!["FalloutNV.esm".into(), "DeadMoney.esm".into()]));
+        let packed = write("packed.esp", plugin_bytes(0x0004_0000, &[b"FalloutNV.esm\0"]));
+        assert_eq!(read_masters(&packed), Masters::Compressed);
+        assert!(master_names(&packed).is_empty());
+        assert_eq!(read_masters(&write("short.esp", b"TES4".to_vec())), Masters::Unreadable);
+        assert_eq!(read_masters(&write("other.esp", plugin_bytes(0, &[]).into_iter().skip(4).collect())), Masters::Unreadable);
+        assert_eq!(read_masters(&write("bytes.esp", plugin_bytes(0, &[b"Caf\xe9.esm\0"]))), Masters::Unreadable);
+        assert_eq!(read_masters(&dir.join("absent.esp")), Masters::Unreadable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reads_master_names_from_the_header() {

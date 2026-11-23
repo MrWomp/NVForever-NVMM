@@ -11,6 +11,7 @@ use eframe::egui::{self, load::Bytes, Align, Color32, CornerRadius, Frame, Layou
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use fnv_install::{guard_write, ini_get, ini_pairs, ini_set, plugins, write_whole, Config, EngineHome, GameInstall};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,8 +132,30 @@ pub struct App {
     mods_present: HashSet<String>,
     /// Plugin name, then the ticked mods that contain it, top of the mod list first.
     plugin_folders: HashMap<String, Vec<String>>,
-    /// Plugin name, then the masters named in the plugin that wins.
-    plugin_masters: HashMap<String, Vec<String>>,
+    /// What the header of each plugin the game would open says about its masters, by
+    /// lowercase name.
+    plugin_masters: HashMap<String, plugins::Masters>,
+    /// Lowercase names of the plugins with a file the game opens: the mod folders that are
+    /// on, the top of the mods folder, or Data (`plugins::layered_plugin_files`).
+    plugin_files: HashSet<String>,
+    /// The enabled plugins' master checks (`modlist::check_masters`), made again only when
+    /// [`App::master_fingerprint`] changes.
+    master_checks: HashMap<String, crate::modlist::MasterCheck>,
+    master_key: Option<u64>,
+    /// The part of that fingerprint the plugin files come from (the folders and the scan),
+    /// so a plugin moved or ticked does not walk the mod folders again.
+    master_files_key: Option<u64>,
+    /// The plugins in the game's Data folder, by lowercase name, from the last folder scan.
+    data_plugins: HashMap<String, PathBuf>,
+    /// What each plugin file's header said, by path, so a folder switched on or off does not
+    /// read every header again. Emptied by each folder scan.
+    master_cache: HashMap<PathBuf, plugins::Masters>,
+    /// Counts [`App::refresh_plugin_notes`] runs: the folders and files behind the checks.
+    notes_gen: u64,
+    /// A start waiting for "Play anyway" while plugins would be left out for their masters.
+    master_ask: Option<Start>,
+    /// The next start skips that question once (the player said Play anyway).
+    masters_waved: bool,
     /// Plugin name, then the mod it belongs to. A lower mod wins.
     plugin_home: HashMap<String, String>,
     /// How many plugins each mod contains.
@@ -385,6 +408,15 @@ impl App {
             mods_present: HashSet::new(),
             plugin_folders: HashMap::new(),
             plugin_masters: HashMap::new(),
+            plugin_files: HashSet::new(),
+            master_checks: HashMap::new(),
+            master_key: None,
+            master_files_key: None,
+            data_plugins: HashMap::new(),
+            master_cache: HashMap::new(),
+            notes_gen: 0,
+            master_ask: None,
+            masters_waved: false,
             plugin_home: HashMap::new(),
             folder_counts: HashMap::new(),
             folder_files: HashMap::new(),
@@ -782,6 +814,15 @@ impl App {
             self.message = Some((format!("{} was not found beside the launcher: pick it on the Game folder page.", launch::GAME_EXE), true));
             return;
         };
+        // Last, once the game folder and program are known and the lists are stored: ask
+        // before a start the game would make without some plugins (their masters).
+        if !std::mem::take(&mut self.masters_waved) {
+            self.ensure_master_checks();
+            if crate::modlist::plugins_left_out(&self.master_checks) > 0 {
+                self.master_ask = Some(start);
+                return;
+            }
+        }
         let layers = self.home.as_ref().map(|h| plugins::mod_content_layers(&h.mods())).unwrap_or_default();
         match launch::spawn(&exe, &start, &layers) {
             Ok(c) => {
@@ -849,6 +890,7 @@ impl eframe::App for App {
         self.quick_window(ctx);
         self.manual_window(ctx);
         self.backup_cut_window(ctx);
+        self.master_ask_window(ctx);
         // Last, after everything that can draw a link (a post's Markdown is in the central
         // panel): egui's own link opening would skip the https rule.
         for url in take_links(ctx) {
@@ -1250,6 +1292,37 @@ fn gold_button(text: &str, on: bool) -> egui::Button<'static> {
 }
 
 /// A large two-line button (title and a small line under it), gold when `primary`.
+/// The plugin files the game would open, by lowercase name, for the master check: the mod
+/// folders in `rows` that are on, highest first, then one loose at the top of `mods`
+/// (`plugins::layered_plugin_files`, the game's own lookup), then `data`'s.
+fn master_sources(mods: Option<&Path>, rows: &[ModRow], data: &HashMap<String, PathBuf>) -> HashMap<String, PathBuf> {
+    let mut files: HashMap<String, PathBuf> = match mods {
+        Some(mods) => {
+            let layers: Vec<PathBuf> = rows.iter().filter(|r| r.on && !r.separator).map(|r| plugins::mod_content_root(&mods.join(&r.name))).collect();
+            plugins::layered_plugin_files(&layers, Some(mods)).into_iter().collect()
+        }
+        None => HashMap::new(),
+    };
+    for (key, path) in data {
+        files.entry(key.clone()).or_insert_with(|| path.clone());
+    }
+    files
+}
+
+/// A small warning triangle, painted, so no font has to carry the sign.
+fn warn_mark(ui: &mut egui::Ui, colour: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+    let painter = ui.painter();
+    let top = egui::pos2(rect.center().x, rect.top() + 1.0);
+    let right = egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0);
+    let left = egui::pos2(rect.left() + 1.0, rect.bottom() - 1.0);
+    painter.add(egui::Shape::convex_polygon(vec![top, right, left], colour, Stroke::NONE));
+    let c = rect.center();
+    painter.line_segment([egui::pos2(c.x, c.y - 2.0), egui::pos2(c.x, c.y + 2.0)], Stroke::new(1.5, theme::BG));
+    painter.circle_filled(egui::pos2(c.x, c.y + 4.5), 0.9, theme::BG);
+    resp
+}
+
 fn big_button(ui: &mut egui::Ui, title: &str, sub: &str, primary: bool, height: f32) -> egui::Response {
     let height = height.clamp(12.0, 180.0);
     let size = Vec2::new(if primary { height * 4.8 } else { height * 3.3 }, height);
@@ -2150,7 +2223,6 @@ impl App {
         self.folder_files.clear();
         let Some(home) = self.home.clone() else { return };
         let mods = home.mods();
-        let mut files: HashMap<String, PathBuf> = HashMap::new();
         for row in &self.mod_rows {
             if row.separator {
                 continue;
@@ -2158,16 +2230,15 @@ impl App {
             let listed = plugins::plugins_in_tree(&mods.join(&row.name));
             self.folder_counts.insert(row.name.clone(), listed.len());
             self.folder_files.insert(row.name.clone(), mod_file_keys(&mods.join(&row.name)));
-            for (name, path) in listed {
+            for (name, _) in listed {
                 let key = name.to_ascii_lowercase();
                 self.plugin_home.insert(key.clone(), row.name.clone());
-                if !row.on {
-                    continue;
+                if row.on {
+                    self.plugin_folders.entry(key).or_default().push(row.name.clone());
                 }
-                self.plugin_folders.entry(key.clone()).or_default().push(row.name.clone());
-                files.insert(key, path);
             }
         }
+        let mut data_plugins = HashMap::new();
         if let Some(game) = self.game() {
             if let Ok(rd) = std::fs::read_dir(&game.data) {
                 for entry in rd.flatten() {
@@ -2176,25 +2247,69 @@ impl App {
                         continue;
                     }
                     let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-                    if !plugins::is_plugin(name) {
-                        continue;
+                    if plugins::is_plugin(name) {
+                        data_plugins.insert(name.to_ascii_lowercase(), path);
                     }
-                    files.entry(name.to_ascii_lowercase()).or_insert(path);
                 }
             }
         }
-        for (key, path) in files {
-            let names = plugins::master_names(&path);
-            if !names.is_empty() {
-                self.plugin_masters.insert(key, names);
-            }
-        }
+        self.data_plugins = data_plugins;
+        self.master_cache.clear();
+        self.notes_gen = self.notes_gen.wrapping_add(1);
         self.recompute_clashes();
     }
 
     fn recompute_clashes(&mut self) {
         let rows: Vec<(String, bool)> = self.mod_rows.iter().map(|r| (r.name.clone(), r.on)).collect();
         self.clashes = clash_notes(&rows, &self.folder_files);
+    }
+
+    /// What the plugin files of the check come from: the folder scan and the mod folders'
+    /// order and on/off.
+    fn master_files_fingerprint(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.notes_gen.hash(&mut h);
+        for r in &self.mod_rows {
+            r.name.hash(&mut h);
+            (r.on, r.separator).hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// What the checks are made from: the plugin files' fingerprint, then the load order and
+    /// each plugin's on/off.
+    fn master_fingerprint(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.master_files_fingerprint().hash(&mut h);
+        for e in self.mods.iter().flat_map(|l| l.entries.iter()) {
+            e.name.to_ascii_lowercase().hash(&mut h);
+            e.active.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Makes the master checks again when the order, an on/off or the folders changed.
+    fn ensure_master_checks(&mut self) {
+        let key = self.master_fingerprint();
+        if self.master_key == Some(key) {
+            return;
+        }
+        self.master_key = Some(key);
+        // The files a master can come from are the ones the game opens: the mod folders that
+        // are on, highest first, then one left loose at the top of the mods folder, then Data.
+        // The game's own lookup gives them (`plugins::layered_plugin_files`), from this page's
+        // rows, which Play saves before it starts the game.
+        // Walked again only when the folders or the scan changed, not for a plugin moved.
+        let files_key = self.master_files_fingerprint();
+        if self.master_files_key != Some(files_key) {
+            self.master_files_key = Some(files_key);
+            let mods = self.home.as_ref().map(|h| h.mods());
+            let files = master_sources(mods.as_deref(), &self.mod_rows, &self.data_plugins);
+            self.plugin_files = files.keys().cloned().collect();
+            self.plugin_masters = files.into_iter().map(|(key, path)| (key, self.master_cache.entry(path.clone()).or_insert_with(|| plugins::read_masters(&path)).clone())).collect();
+        }
+        let order: Vec<(String, bool)> = self.mods.iter().flat_map(|l| l.entries.iter()).map(|e| (e.name.clone(), e.active)).collect();
+        self.master_checks = crate::modlist::check_masters(&order, &self.plugin_files, &self.plugin_masters);
     }
 
     fn mods_page(&mut self, ui: &mut egui::Ui) {
@@ -2542,13 +2657,20 @@ impl App {
 
     fn plugin_column(&mut self, ui: &mut egui::Ui) {
         self.backup_row(ui);
+        self.ensure_master_checks();
         let folders = self.plugin_folders.clone();
-        let masters = self.plugin_masters.clone();
+        let checks = self.master_checks.clone();
+        let left_out = crate::modlist::plugins_left_out(&checks);
         let active = self.mods.as_ref().map(|l| l.entries.iter().filter(|e| e.active).count()).unwrap_or(0);
         // The number is how many plugins are on. There is no slot cap.
         ui.horizontal(|ui| {
             ui.label(RichText::new("Load order").small().color(GOLD)).on_hover_text("Right-click a plugin. An ESM is a master and should sit above the plugins that need it.");
             ui.label(RichText::new(active.to_string()).small().color(WEAK)).on_hover_text("Plugins that are enabled.");
+            if left_out > 0 {
+                warn_mark(ui, BAD);
+                ui.label(RichText::new(format!("{left_out} left out for their masters")).small().color(BAD))
+                    .on_hover_text("Enabled plugins whose masters are missing, off or loaded after them. The game starts without them. Hover a marked plugin for why.");
+            }
         });
         let mut only_folder = self.plugin_only_folder.clone();
         if let Some(folder) = only_folder.clone() {
@@ -2570,13 +2692,11 @@ impl App {
         };
         ui.add(egui::TextEdit::singleline(&mut self.plugin_find).hint_text("Find a plugin").desired_width(ui.available_width()));
         let find = self.plugin_find.trim().to_ascii_lowercase();
-        let active_names: HashSet<String> = list.entries.iter().filter(|e| e.active).map(|e| e.name.to_ascii_lowercase()).collect();
         let present = self.mods_present.clone();
         let is_esm: Vec<bool> = list.entries.iter().map(|e| e.name.to_ascii_lowercase().ends_with(".esm")).collect();
         let n = list.entries.len();
         let is_base: Vec<bool> = list.entries.iter().map(|e| e.name.eq_ignore_ascii_case("FalloutNV.esm")).collect();
         let fixed = is_base.iter().take_while(|b| **b).count();
-        let order_at: HashMap<String, usize> = list.entries.iter().enumerate().map(|(i, e)| (e.name.to_ascii_lowercase(), i)).collect();
         let folder_on: HashMap<String, bool> = self.mod_rows.iter().filter(|r| !r.separator).map(|r| (r.name.clone(), r.on)).collect();
         let mut moved: Option<(usize, usize)> = None;
         let mut menu: Option<PluginAct> = None;
@@ -2666,18 +2786,18 @@ impl App {
                                 }
                             }
                             if e.active {
-                                if let Some(need) = masters.get(&key) {
-                                    let off: Vec<&str> = need.iter().filter(|m| !active_names.contains(&m.to_ascii_lowercase())).map(String::as_str).collect();
-                                    if !off.is_empty() {
-                                        ui.label(RichText::new(format!("needs {}", off.join(", "))).small().color(BAD));
+                                match checks.get(&key) {
+                                    Some(crate::modlist::MasterCheck::Problems(problems)) => {
+                                        let names: Vec<&str> = problems.iter().map(|p| p.master()).collect();
+                                        let lines: Vec<String> = problems.iter().map(|p| format!("• {}", p.line())).collect();
+                                        let tip = format!("The game leaves this plugin out, and any plugin that needs it:\n{}", lines.join("\n"));
+                                        warn_mark(ui, BAD).on_hover_text(&tip);
+                                        ui.label(RichText::new(format!("needs {}", names.join(", "))).small().color(BAD)).on_hover_text(tip);
                                     }
-                                    let lower: Vec<&str> = need.iter().filter(|m| {
-                                        let mk = m.to_ascii_lowercase();
-                                        active_names.contains(&mk) && crate::modlist::master_is_lower(i, order_at.get(&mk).copied())
-                                    }).map(String::as_str).collect();
-                                    if !lower.is_empty() {
-                                        ui.label(RichText::new(format!("master is lower: {}", lower.join(", "))).small().color(BAD));
+                                    Some(crate::modlist::MasterCheck::CantCheck(why)) => {
+                                        ui.label(RichText::new("masters not checked").small().color(WEAK)).on_hover_text(*why);
                                     }
+                                    None => {}
                                 }
                             }
                         });
@@ -5090,6 +5210,58 @@ impl App {
     }
 
     /// Lowering the cap asks first. Yes deletes the oldest backups. No leaves the cap alone.
+    /// Asks before a start while enabled plugins would be left out for their masters.
+    fn master_ask_window(&mut self, ctx: &egui::Context) {
+        let Some(start) = self.master_ask.clone() else { return };
+        let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+        for e in self.mods.iter().flat_map(|l| l.entries.iter()) {
+            if let Some(crate::modlist::MasterCheck::Problems(problems)) = self.master_checks.get(&e.name.to_ascii_lowercase()) {
+                rows.push((e.name.clone(), problems.iter().map(|p| p.line()).collect()));
+            }
+        }
+        let mut open = true;
+        let mut answer = None;
+        egui::Window::new("Plugins left out")
+            .collapsible(false)
+            .resizable(false)
+            .constrain(true)
+            .max_size(fit_to_screen(ctx))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                let n = rows.len();
+                ui.label(if n == 1 { "1 enabled plugin will be left out by the game.".to_string() } else { format!("{n} enabled plugins will be left out by the game.") });
+                ui.label(RichText::new("Their masters are missing, off or loaded after them. The game starts without them, and without any plugin that needs them.").small().color(WEAK));
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    for (name, lines) in &rows {
+                        ui.label(RichText::new(name).strong());
+                        for line in lines {
+                            ui.label(RichText::new(format!("  {line}")).small().color(BAD));
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Play anyway").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        match answer {
+            Some(true) => {
+                self.master_ask = None;
+                self.masters_waved = true;
+                self.start(ctx, start);
+            }
+            Some(false) => self.master_ask = None,
+            None if !open => self.master_ask = None,
+            None => {}
+        }
+    }
+
     fn backup_cut_window(&mut self, ctx: &egui::Context) {
         let Some(n) = self.backup_cut else { return };
         let extra = self.home.as_ref().map(|h| plugin_backups(h).len().saturating_sub(n as usize)).unwrap_or(0);
@@ -6090,6 +6262,35 @@ mod tests {
         assert!(back.iter().any(|r| r.separator && r.name == "Quests"));
         assert!(back.iter().any(|r| r.locked && r.name == "A"));
         assert_eq!(back.iter().filter(|r| !r.separator).map(|r| r.name.as_str()).collect::<Vec<_>>(), ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn the_master_check_sees_the_files_the_game_opens() {
+        let t = std::env::temp_dir().join(format!("nvf-master-sources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (mods, data) = (t.join("mods"), t.join("Data"));
+        for (dir, file) in [("Low", "Shared.esm"), ("High", "Shared.esm"), ("Off", "OnlyOff.esm"), ("Packed/Data", "Packed.esm")] {
+            std::fs::create_dir_all(mods.join(dir)).unwrap();
+            std::fs::write(mods.join(dir).join(file), dir).unwrap();
+        }
+        std::fs::write(mods.join("Loose.esp"), "top").unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("FalloutNV.esm"), "base").unwrap();
+        let rows = vec![super::ModRow::module("Low", true), super::ModRow::module("High", true), super::ModRow::module("Off", false), super::ModRow::module("Packed", true)];
+        let data_plugins: HashMap<String, PathBuf> = [("falloutnv.esm".to_string(), data.join("FalloutNV.esm"))].into_iter().collect();
+        let files = super::master_sources(Some(&mods), &rows, &data_plugins);
+        // The higher folder's copy, a mod's Data folder, the loose one, and Data.
+        assert_eq!(files.get("shared.esm"), Some(&mods.join("High/Shared.esm")));
+        assert_eq!(files.get("packed.esm"), Some(&mods.join("Packed/Data/Packed.esm")));
+        assert_eq!(files.get("loose.esp"), Some(&mods.join("Loose.esp")));
+        assert_eq!(files.get("falloutnv.esm"), Some(&data.join("FalloutNV.esm")));
+        // A master only in a folder that is off is not a file the game opens: missing.
+        assert!(!files.contains_key("onlyoff.esm"));
+        // Turn that folder on: it is.
+        let mut on = rows.clone();
+        on[2].on = true;
+        assert!(super::master_sources(Some(&mods), &on, &data_plugins).contains_key("onlyoff.esm"));
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[test]

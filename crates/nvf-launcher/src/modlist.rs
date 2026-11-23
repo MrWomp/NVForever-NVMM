@@ -1,7 +1,7 @@
 //! Mod-list rules that do not draw the window: names, priority,
 //! a profile comparison, archive names, and a pack of the three list files.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A folder sitting in `mods/` that is part of a mod, not a mod itself.
@@ -112,9 +112,116 @@ pub fn compare_lists(left_name: &str, left_mods: &[(String, bool)], right_name: 
     }
 }
 
-/// True when `master` is ticked and sits below `plugin` in the load order.
-pub fn master_is_lower(plugin_at: usize, master_at: Option<usize>) -> bool {
-    master_at.is_some_and(|at| at > plugin_at)
+/// What is wrong with one master of an enabled plugin. Any of these makes the game leave
+/// the plugin out, and with it every plugin that needs it [documented:
+/// `fnv_esm::loadorder::drop_unloadable`, used by the game's `world::open_plugins`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MasterProblem {
+    /// No file of that name the game opens: not in a mod folder that is on, not loose at
+    /// the top of the mods folder, not in Data.
+    Missing(String),
+    /// The file is there, but the plugin is off (so not in the load order).
+    Off(String),
+    /// On, but it loads after the plugin that needs it.
+    Later(String),
+    /// On and before it, but the game leaves that master out for its own masters.
+    Dropped(String),
+}
+
+impl MasterProblem {
+    pub fn master(&self) -> &str {
+        match self {
+            Self::Missing(m) | Self::Off(m) | Self::Later(m) | Self::Dropped(m) => m,
+        }
+    }
+
+    /// One line for a tooltip.
+    pub fn line(&self) -> String {
+        match self {
+            Self::Missing(m) => format!("{m} is missing: not in a mod folder that is on, the top of the mods folder, or Data."),
+            Self::Off(m) => format!("{m} is off."),
+            Self::Later(m) => format!("{m} loads after this plugin."),
+            Self::Dropped(m) => format!("{m} is left out itself (its own masters)."),
+        }
+    }
+}
+
+/// The master check of one enabled plugin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MasterCheck {
+    /// The game leaves this plugin out, for these reasons.
+    Problems(Vec<MasterProblem>),
+    /// The header could not be read for masters, so nothing is known.
+    CantCheck(&'static str),
+}
+
+/// The master checks of the enabled plugins, by lowercase name. A plugin whose masters are
+/// all fine has no entry, nor has a plugin with no file (the list marks it missing on its
+/// own; the game leaves it out too, so its dependents are flagged).
+///
+/// `order` is the load order, first loaded first, with each plugin's on/off. `files` holds
+/// the lowercase names that have a file the game opens: a mod folder that is on, the top of
+/// the mods folder, or Data (`fnv_install::plugins::layered_plugin_files`, the game's own
+/// lookup on a start through the launcher).
+/// `masters` holds what each file's header gave (`fnv_install::plugins::read_masters`).
+/// One pass in load order is enough, because a master loads first [documented:
+/// `drop_unloadable`].
+pub fn check_masters(order: &[(String, bool)], files: &HashSet<String>, masters: &HashMap<String, fnv_install::plugins::Masters>) -> HashMap<String, MasterCheck> {
+    use fnv_install::plugins::Masters;
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for (i, (name, on)) in order.iter().enumerate() {
+        if *on {
+            at.entry(name.to_ascii_lowercase()).or_insert(i);
+        }
+    }
+    let mut out = HashMap::new();
+    let mut left_out: HashSet<String> = HashSet::new();
+    for (i, (name, on)) in order.iter().enumerate() {
+        if !on {
+            continue;
+        }
+        let key = name.to_ascii_lowercase();
+        if !files.contains(&key) {
+            left_out.insert(key);
+            continue;
+        }
+        let listed = match masters.get(&key) {
+            Some(Masters::Listed(listed)) => listed,
+            Some(Masters::Compressed) => {
+                out.insert(key, MasterCheck::CantCheck("Its header is compressed, so its masters are not read here."));
+                continue;
+            }
+            Some(Masters::Unreadable) | None => {
+                out.insert(key, MasterCheck::CantCheck("Its header could not be read."));
+                continue;
+            }
+        };
+        let mut problems = Vec::new();
+        for master in listed {
+            let mk = master.to_ascii_lowercase();
+            let problem = if !files.contains(&mk) {
+                MasterProblem::Missing(master.clone())
+            } else {
+                match at.get(&mk) {
+                    None => MasterProblem::Off(master.clone()),
+                    Some(&m) if m > i => MasterProblem::Later(master.clone()),
+                    Some(_) if left_out.contains(&mk) => MasterProblem::Dropped(master.clone()),
+                    Some(_) => continue,
+                }
+            };
+            problems.push(problem);
+        }
+        if !problems.is_empty() {
+            left_out.insert(key.clone());
+            out.insert(key, MasterCheck::Problems(problems));
+        }
+    }
+    out
+}
+
+/// How many enabled plugins the game would leave out for their masters.
+pub fn plugins_left_out(checks: &HashMap<String, MasterCheck>) -> usize {
+    checks.values().filter(|c| matches!(c, MasterCheck::Problems(_))).count()
 }
 
 /// Move masters up among the plugins that are not locked. `readable` is false when a header could not be read.
@@ -251,6 +358,75 @@ pub fn append_log(path: &Path, line: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod master_check_tests {
+    use super::{check_masters, plugins_left_out, MasterCheck, MasterProblem};
+    use fnv_install::plugins::Masters;
+    use std::collections::{HashMap, HashSet};
+
+    fn order(rows: &[(&str, bool)]) -> Vec<(String, bool)> {
+        rows.iter().map(|(n, on)| (n.to_string(), *on)).collect()
+    }
+
+    fn files(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_ascii_lowercase()).collect()
+    }
+
+    fn masters(rows: &[(&str, Masters)]) -> HashMap<String, Masters> {
+        rows.iter().map(|(n, m)| (n.to_ascii_lowercase(), m.clone())).collect()
+    }
+
+    fn needs(names: &[&str]) -> Masters {
+        Masters::Listed(names.iter().map(|n| n.to_string()).collect())
+    }
+
+    #[test]
+    fn a_plugin_with_its_masters_on_and_first_is_fine() {
+        let o = order(&[("FalloutNV.esm", true), ("Mod.esp", true)]);
+        let checks = check_masters(&o, &files(&["FalloutNV.esm", "Mod.esp"]), &masters(&[("FalloutNV.esm", needs(&[])), ("mod.esp", needs(&["falloutnv.esm"]))]));
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn missing_off_and_later_masters() {
+        let o = order(&[("FalloutNV.esm", true), ("Mod.esp", true), ("Off.esm", false), ("Late.esm", true)]);
+        let f = files(&["FalloutNV.esm", "Mod.esp", "Off.esm", "Late.esm"]);
+        let m = masters(&[("FalloutNV.esm", needs(&[])), ("Mod.esp", needs(&["FalloutNV.esm", "Gone.esm", "Off.esm", "Late.esm"])), ("Late.esm", needs(&["FalloutNV.esm"]))]);
+        let checks = check_masters(&o, &f, &m);
+        assert_eq!(
+            checks.get("mod.esp"),
+            Some(&MasterCheck::Problems(vec![MasterProblem::Missing("Gone.esm".into()), MasterProblem::Off("Off.esm".into()), MasterProblem::Later("Late.esm".into())]))
+        );
+        assert_eq!(checks.len(), 1);
+        assert_eq!(plugins_left_out(&checks), 1);
+    }
+
+    #[test]
+    fn a_plugin_whose_master_is_left_out_goes_too() {
+        let o = order(&[("FalloutNV.esm", true), ("Base.esm", true), ("Patch.esp", true)]);
+        let f = files(&["FalloutNV.esm", "Base.esm", "Patch.esp"]);
+        let m = masters(&[("FalloutNV.esm", needs(&[])), ("Base.esm", needs(&["Gone.esm"])), ("Patch.esp", needs(&["Base.esm"]))]);
+        let checks = check_masters(&o, &f, &m);
+        assert_eq!(checks.get("patch.esp"), Some(&MasterCheck::Problems(vec![MasterProblem::Dropped("Base.esm".into())])));
+        assert_eq!(plugins_left_out(&checks), 2);
+        // A plugin with no file is left out by the game; one that needs it is flagged.
+        let o = order(&[("Base.esm", true), ("Patch.esp", true)]);
+        let checks = check_masters(&o, &files(&["Patch.esp"]), &masters(&[("Patch.esp", needs(&["Base.esm"]))]));
+        assert_eq!(checks.get("patch.esp"), Some(&MasterCheck::Problems(vec![MasterProblem::Missing("Base.esm".into())])));
+    }
+
+    #[test]
+    fn a_compressed_or_unreadable_header_is_not_checked_and_not_counted() {
+        let o = order(&[("Packed.esp", true), ("Broken.esp", true), ("Off.esp", false)]);
+        let checks = check_masters(&o, &files(&["Packed.esp", "Broken.esp", "Off.esp"]), &masters(&[("Packed.esp", Masters::Compressed), ("Broken.esp", Masters::Unreadable), ("Off.esp", needs(&["Gone.esm"]))]));
+        assert!(matches!(checks.get("packed.esp"), Some(MasterCheck::CantCheck(_))));
+        assert!(matches!(checks.get("broken.esp"), Some(MasterCheck::CantCheck(_))));
+        // A plugin that is off is not checked.
+        assert!(!checks.contains_key("off.esp"));
+        assert_eq!(plugins_left_out(&checks), 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -289,13 +465,6 @@ mod tests {
         assert!(text.contains("A is only in One"));
         assert!(text.contains("C is only in Two"));
         assert!(text.contains("B.esp is only in Two"));
-    }
-
-    #[test]
-    fn a_master_below_its_plugin_is_flagged() {
-        assert!(master_is_lower(1, Some(3)));
-        assert!(!master_is_lower(3, Some(1)));
-        assert!(!master_is_lower(1, None));
     }
 
     #[test]

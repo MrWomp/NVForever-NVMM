@@ -89,6 +89,40 @@ name order. Folder on/off is not applied on that path
 `--mo2` is not this path. It still only reads another program's instance.
 The launcher does not write that instance.
 
+## Masters the game would refuse
+
+The game starts without an enabled plugin whose master is not in the load order
+or loads after it, and without every plugin that needs a plugin it left out
+[documented: `fnv_esm::loadorder::drop_unloadable`, called by the game's
+`world::open_plugins`]. The plugin list marks those plugins before the start, so
+the player sees it before playing:
+
+- A plugin's masters are the `MAST` names of its header record, in order
+  [documented: docs/spec-notes/esm.md, "TES4"; `plugins::read_masters`]. Only
+  the 24-byte record header and that record are read.
+- A master is **missing** when the game would open no file of that name: none in
+  a mod folder that is on, none loose at the top of the mods folder, none in
+  Data. The check asks the game's own lookup for this, from the page's rows
+  [documented: `plugins::layered_plugin_files`, which the game uses on a start
+  through the launcher]. A master whose only copy is in a folder that is off is
+  missing.
+  A master is **off** when its file is there but it is not ticked. A master
+  **loads after** the plugin when it is ticked but lower in the list. A master
+  the game leaves out for its own masters makes its dependents go too.
+- A header record that is compressed (flag `0x00040000`) or cannot be read is
+  shown as "masters not checked". It is never shown as fine, and it is not
+  counted as left out [design].
+- The check runs again only when the load order, a plugin's on/off or the mod
+  folders change; the mod folders are walked again only when the folders' order
+  or on/off or the folder scan change, and each header is read once per scan. A
+  frame compares a fingerprint of those [design].
+- The count by the Load order heading is of plugins left out for their masters.
+  A ticked plugin whose own file is in no folder that is on is already greyed on
+  its row ("Not in a ticked mod, and not in Data") and is not in that count
+  [design].
+- Play, Continue and the other starts ask "Play anyway" or "Cancel" while a
+  plugin would be left out [design]. Nothing is written by the check.
+
 ## A named profile
 
 [documented: docs/spec-notes/launcher-profile.md] **Save** writes
