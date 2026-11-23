@@ -118,7 +118,8 @@ pub fn exit_message(code: Option<i32>, success: bool, logs: Option<&Path>) -> Op
     })
 }
 
-/// Open one of the launcher's own folders with the system's file browser.
+/// Open a folder with the system's file browser: one of the launcher's own, or the game's
+/// `Data` for Open Origin on a plugin. Opening writes nothing.
 pub fn open_folder(dir: &Path) {
     open(&dir.display().to_string());
 }

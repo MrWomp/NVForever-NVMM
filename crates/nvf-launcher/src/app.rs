@@ -135,6 +135,15 @@ pub struct App {
     plugin_masters: HashMap<String, Vec<String>>,
     /// Plugin name, then the mod it belongs to. A lower mod wins.
     plugin_home: HashMap<String, String>,
+    /// Plugin name, then where under the mods folder it is read from, for the page's rows as
+    /// they are this frame (`plugin_origins`). `plugin_origin` adds `Data`.
+    origins: HashMap<String, Origin>,
+    /// Each mod folder's plugins, lower case, from the last folder scan (`plugins_in_tree`).
+    row_plugins: HashMap<String, Vec<String>>,
+    /// Plugins loose at the top of the mods folder, from the last folder scan.
+    loose_plugins: HashSet<String>,
+    /// The plugin list's view: load order, or sorted by the Origin column.
+    plugin_sort: PluginSort,
     /// How many plugins each mod contains.
     folder_counts: HashMap<String, usize>,
     /// Loose files and plugins in each mod, relative to its Data folder when it has one.
@@ -322,9 +331,142 @@ struct ManualAsk {
     name: String,
 }
 
+/// Where the game reads a plugin from on a start through the launcher: the plugin list's
+/// Origin column, "Open Origin in Explorer", and the mod a picked plugin marks
+/// (docs/spec-notes/mod-manager.md, "The plugin list's Origin column").
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Origin {
+    /// The highest-priority mod folder that is on and has the plugin.
+    Mod(String),
+    /// Loose at the top of the mods folder, outside every mod folder.
+    ModsFolder,
+    /// The game's `Data` folder.
+    Data,
+    /// Only in mod folders that are off, so the game does not read it: the highest of them.
+    Off(String),
+}
+
+impl Origin {
+    /// The column's text.
+    fn label(&self) -> String {
+        match self {
+            Origin::Mod(name) => name.clone(),
+            Origin::ModsFolder => "mods folder".into(),
+            Origin::Data => "Data".into(),
+            Origin::Off(name) => format!("{name} (off)"),
+        }
+    }
+
+    /// Whether the game reads the plugin from here.
+    fn read(&self) -> bool {
+        !matches!(self, Origin::Off(_))
+    }
+}
+
+/// The Origin column's hover text. `None` is a plugin with no file anywhere the column looks.
+fn origin_tip(origin: Option<&Origin>) -> String {
+    match origin {
+        Some(Origin::Mod(name)) => format!("The game reads this plugin from the mod {name}."),
+        Some(Origin::ModsFolder) => "The game reads this plugin from the top of the mods folder, outside every mod folder.".into(),
+        Some(Origin::Data) => "The game reads this plugin from the game's Data folder.".into(),
+        Some(Origin::Off(name)) => format!("Only in {name}, which is off. The game does not read this copy."),
+        None => "No file for this plugin: not in a mod folder, the mods folder, or Data.".into(),
+    }
+}
+
+/// How the plugin list is shown. Only the view changes: the load order stays as it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PluginSort {
+    #[default]
+    Load,
+    /// By the Origin column, A to Z.
+    OriginUp,
+    /// By the Origin column, Z to A.
+    OriginDown,
+}
+
+impl PluginSort {
+    /// What a click on the column's heading turns it into.
+    fn next(self) -> Self {
+        match self {
+            PluginSort::Load => PluginSort::OriginUp,
+            PluginSort::OriginUp => PluginSort::OriginDown,
+            PluginSort::OriginDown => PluginSort::Load,
+        }
+    }
+}
+
+/// Plugins left loose at the top of the mods folder, outside every mod folder, lower case: the
+/// files `plugins::layered_plugin_files` takes from `mods_top`.
+fn loose_plugins(mods: &Path) -> HashSet<String> {
+    let Ok(rd) = std::fs::read_dir(mods) else { return HashSet::new() };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).filter(|n| plugins::is_plugin(n)).map(str::to_ascii_lowercase))
+        .collect()
+}
+
+/// Where each plugin under the mods folder is read from on a start through the launcher, from
+/// the last folder scan: `row_plugins` holds each mod folder's plugins as
+/// `plugins::plugins_in_tree` lists that folder, `loose` the plugins at its top
+/// (`loose_plugins`). The game's lookup (`plugins::layered_plugin_files`) searches the same
+/// folders, so the order alone decides: the highest folder that is on and has the plugin, then
+/// the top of the mods folder. A plugin none of those has gets the highest folder that is off
+/// and has it (`Origin::Off`). `Data` comes after the layers and before a folder that is off;
+/// `origin_of` adds it. No file is read here, so a folder turned on or off, or moved, costs
+/// nothing.
+fn plugin_origins(rows: &[ModRow], row_plugins: &HashMap<String, Vec<String>>, loose: &HashSet<String>) -> HashMap<String, Origin> {
+    let mut found: HashMap<String, Origin> = HashMap::new();
+    let folders = |on: bool| rows.iter().rev().filter(move |r| r.on == on && !r.separator);
+    for row in folders(true) {
+        for key in row_plugins.get(&row.name).into_iter().flatten() {
+            found.entry(key.clone()).or_insert_with(|| Origin::Mod(row.name.clone()));
+        }
+    }
+    for key in loose {
+        found.entry(key.clone()).or_insert(Origin::ModsFolder);
+    }
+    for row in folders(false) {
+        for key in row_plugins.get(&row.name).into_iter().flatten() {
+            found.entry(key.clone()).or_insert_with(|| Origin::Off(row.name.clone()));
+        }
+    }
+    found
+}
+
+/// One plugin's origin from `found` (`plugin_origins`) and whether the game's `Data` has it
+/// (`in_data`): a layer or the top of the mods folder, then `Data`, then a folder that is off.
+fn origin_of(key: &str, found: &HashMap<String, Origin>, in_data: bool) -> Option<Origin> {
+    match found.get(key) {
+        Some(origin) if origin.read() => Some(origin.clone()),
+        _ if in_data => Some(Origin::Data),
+        off => off.cloned(),
+    }
+}
+
+/// The order the plugin list draws its entries in (indexes into the load order). Sorted by
+/// origin, two plugins with the same origin keep their load order, and a plugin with no
+/// origin comes last.
+fn plugin_view_order(origins: &[Option<Origin>], sort: PluginSort) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..origins.len()).collect();
+    if sort == PluginSort::Load {
+        return order;
+    }
+    let text: Vec<Option<String>> = origins.iter().map(|o| o.as_ref().map(|o| o.label().to_lowercase())).collect();
+    order.sort_by(|&a, &b| match (&text[a], &text[b]) {
+        (Some(x), Some(y)) if sort == PluginSort::OriginDown => y.cmp(x),
+        (Some(x), Some(y)) => x.cmp(y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    order
+}
+
 /// What a right-click on a plugin row asked for.
 enum PluginAct {
-    /// The owning mod, so the row can open that folder.
+    /// Open the folder the Origin column names, and mark its mod in the mod list.
     Show(usize),
     Copy(String),
     /// Enable or disable the plugins in the multi-select. FalloutNV.esm stays.
@@ -386,6 +528,10 @@ impl App {
             plugin_folders: HashMap::new(),
             plugin_masters: HashMap::new(),
             plugin_home: HashMap::new(),
+            origins: HashMap::new(),
+            row_plugins: HashMap::new(),
+            loose_plugins: HashSet::new(),
+            plugin_sort: PluginSort::Load,
             folder_counts: HashMap::new(),
             folder_files: HashMap::new(),
             clashes: HashMap::new(),
@@ -2148,8 +2294,11 @@ impl App {
         self.plugin_home.clear();
         self.folder_counts.clear();
         self.folder_files.clear();
+        self.row_plugins.clear();
+        self.loose_plugins.clear();
         let Some(home) = self.home.clone() else { return };
         let mods = home.mods();
+        self.loose_plugins = loose_plugins(&mods);
         let mut files: HashMap<String, PathBuf> = HashMap::new();
         for row in &self.mod_rows {
             if row.separator {
@@ -2157,6 +2306,7 @@ impl App {
             }
             let listed = plugins::plugins_in_tree(&mods.join(&row.name));
             self.folder_counts.insert(row.name.clone(), listed.len());
+            self.row_plugins.insert(row.name.clone(), listed.iter().map(|(name, _)| name.to_ascii_lowercase()).collect());
             self.folder_files.insert(row.name.clone(), mod_file_keys(&mods.join(&row.name)));
             for (name, path) in listed {
                 let key = name.to_ascii_lowercase();
@@ -2197,7 +2347,27 @@ impl App {
         self.clashes = clash_notes(&rows, &self.folder_files);
     }
 
+    /// Where the game reads plugin `key` (lower case) from. `in_data`: the game's `Data` has it.
+    fn plugin_origin(&self, key: &str, in_data: bool) -> Option<Origin> {
+        origin_of(key, &self.origins, in_data)
+    }
+
+    /// Open the folder an origin names with the system's file browser. Writes nothing.
+    fn open_origin(&mut self, origin: &Origin) {
+        let dir = match origin {
+            Origin::Mod(name) | Origin::Off(name) => Self::one_name(name).ok().and_then(|_| self.home.as_ref().map(|h| h.mods().join(name))),
+            Origin::ModsFolder => self.home.as_ref().map(|h| h.mods()),
+            Origin::Data => self.game().map(|g| g.data),
+        };
+        match dir {
+            Some(dir) if dir.is_dir() => launch::open_folder(&dir),
+            _ => self.message = Some(("That folder was not opened.".into(), true)),
+        }
+    }
+
     fn mods_page(&mut self, ui: &mut egui::Ui) {
+        // From the last folder scan and the rows as they are now: no file is read here.
+        self.origins = plugin_origins(&self.mod_rows, &self.row_plugins, &self.loose_plugins);
         let help = "Left: the profile and the mod list. Right: plugins. Drag a row to change priority. Right-click a mod or a plugin. Drop a folder or an archive on the list to install it. Apply saves the lists. Nothing is copied into Data.";
         ui.horizontal(|ui| {
             let unsaved = self.page_unsaved();
@@ -2343,7 +2513,14 @@ impl App {
         self.mod_rename_line(ui);
         self.mod_recycle_line(ui);
         let mod_find = self.mod_find.trim().to_ascii_lowercase();
-        let marked = self.picked_plugin.as_ref().and_then(|key| self.plugin_home.get(key)).cloned();
+        // The mod the picked plugin's origin names (the Origin column), on or off.
+        let marked = self.picked_plugin.clone().and_then(|key| {
+            let in_data = self.game().is_some_and(|g| g.data_file(&key).is_some());
+            match self.plugin_origin(&key, in_data) {
+                Some(Origin::Mod(name) | Origin::Off(name)) => Some(name),
+                _ => None,
+            }
+        });
         if self.show_overwrites {
             ui.label(RichText::new("Higher priority overwrites the same loose file. Green wins. Red loses. Hover a line for the paths.").small().color(WEAK));
         }
@@ -2564,11 +2741,54 @@ impl App {
             let names: Vec<String> = self.mods.as_ref().map(|l| l.entries.iter().map(|e| e.name.clone()).collect()).unwrap_or_default();
             self.game().map(|g| names.into_iter().filter(|name| g.data_file(name).is_some()).map(|name| name.to_ascii_lowercase()).collect()).unwrap_or_default()
         };
+        // Each entry's origin, in load order; the view order, which a sort changes and nothing else.
+        let origins_now: Vec<Option<Origin>> = self
+            .mods
+            .as_ref()
+            .map(|l| {
+                l.entries
+                    .iter()
+                    .map(|e| {
+                        let key = e.name.to_ascii_lowercase();
+                        let here = in_data.contains(&key);
+                        self.plugin_origin(&key, here)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let sorted = self.plugin_sort != PluginSort::Load;
+        let view = plugin_view_order(&origins_now, self.plugin_sort);
+        let origin_w = (ui.available_width() * 0.28).clamp(64.0, 200.0);
+        let mut open_at: Option<Origin> = None;
         let Some(list) = &mut self.mods else {
             ui.label("No plugin list yet: set the game folder first, or start the game once.");
             return;
         };
         ui.add(egui::TextEdit::singleline(&mut self.plugin_find).hint_text("Find a plugin").desired_width(ui.available_width()));
+        // The column headings, inset as the rows are. Origin sorts: A to Z, Z to A, load order.
+        Frame::new().inner_margin(Margin::symmetric(10, 0)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Plugin").small().color(WEAK));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.allocate_ui_with_layout(Vec2::new(origin_w, 18.0), Layout::left_to_right(Align::Center), |ui| {
+                        ui.set_width(origin_w);
+                        let text = match self.plugin_sort {
+                            PluginSort::Load => "Origin",
+                            PluginSort::OriginUp => "Origin A–Z",
+                            PluginSort::OriginDown => "Origin Z–A",
+                        };
+                        let color = if sorted { GOLD } else { WEAK };
+                        let head = ui
+                            .add(egui::Label::new(RichText::new(text).small().color(color)).sense(Sense::click()))
+                            .on_hover_text("Where the game reads each plugin from. Click to sort by it, again to reverse, and a third time for the load order. Sorting changes only the view, and a sorted list cannot be dragged.")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if head.clicked() {
+                            self.plugin_sort = self.plugin_sort.next();
+                        }
+                    });
+                });
+            });
+        });
         let find = self.plugin_find.trim().to_ascii_lowercase();
         let active_names: HashSet<String> = list.entries.iter().filter(|e| e.active).map(|e| e.name.to_ascii_lowercase()).collect();
         let present = self.mods_present.clone();
@@ -2577,14 +2797,14 @@ impl App {
         let is_base: Vec<bool> = list.entries.iter().map(|e| e.name.eq_ignore_ascii_case("FalloutNV.esm")).collect();
         let fixed = is_base.iter().take_while(|b| **b).count();
         let order_at: HashMap<String, usize> = list.entries.iter().enumerate().map(|(i, e)| (e.name.to_ascii_lowercase(), i)).collect();
-        let folder_on: HashMap<String, bool> = self.mod_rows.iter().filter(|r| !r.separator).map(|r| (r.name.clone(), r.on)).collect();
         let mut moved: Option<(usize, usize)> = None;
         let mut menu: Option<PluginAct> = None;
         egui::ScrollArea::both().id_salt("plugin-rows").auto_shrink([false, false]).show(ui, |ui| {
             let mut rects = Vec::with_capacity(n);
             let mut last_esm = false;
             let mut toggled = false;
-            for (i, e) in list.entries.iter_mut().enumerate() {
+            for &i in &view {
+                let e = &mut list.entries[i];
                 if !find.is_empty() && !e.name.to_ascii_lowercase().contains(&find) {
                     continue;
                 }
@@ -2597,7 +2817,7 @@ impl App {
                         continue;
                     }
                 }
-                if last_esm && !is_esm[i] {
+                if !sorted && last_esm && !is_esm[i] {
                     ui.separator();
                 }
                 last_esm = is_esm[i];
@@ -2614,14 +2834,16 @@ impl App {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             let (grip, _) = ui.allocate_exact_size(Vec2::new(14.0, 18.0), Sense::hover());
-                            if !base {
+                            // No grip while sorted: that list cannot be dragged. The space stays, so the columns line up.
+                            if !base && !sorted {
                                 let c = if hot { GOLD } else { WEAK };
                                 for k in [-4.0, 0.0, 4.0] {
                                     let y = grip.center().y + k;
                                     ui.painter().line_segment([egui::pos2(grip.left() + 1.0, y), egui::pos2(grip.right() - 1.0, y)], Stroke::new(1.5, c));
                                 }
                             }
-                            ui.label(RichText::new(format!("{i:02}")).small().monospace().color(WEAK)).on_hover_text("Priority. A plugin lower in this list loads later.");
+                            let place = if sorted { "Load position. A higher number loads later." } else { "Priority. A plugin lower in this list loads later." };
+                            ui.label(RichText::new(format!("{i:02}")).small().monospace().color(WEAK)).on_hover_text(place);
                             ui.label(RichText::new(format!("{:02X}", i)).monospace().color(WEAK)).on_hover_text("Mod index.");
                             if ui.add_enabled(!base, egui::Checkbox::without_text(&mut e.active)).changed() {
                                 self.mods_dirty = true;
@@ -2630,25 +2852,26 @@ impl App {
                                 self.mod_find.clear();
                                 self.mod_jump = true;
                             }
+                            let origin = origins_now[i].as_ref();
                             name_rect = {
-                                let key = e.name.to_ascii_lowercase();
-                                let ticked = self.plugin_home.get(&key).and_then(|folder| folder_on.get(folder)).copied().unwrap_or(false);
-                                let grey = !base && !ticked && !in_data.contains(&key);
+                                let grey = !base && !origin.is_some_and(Origin::read);
                                 let text = if grey { RichText::new(&e.name).color(WEAK) } else { RichText::new(&e.name) };
-                                let rest = ui.available_width().max(48.0);
-                                let folder = self.plugin_home.get(&key).cloned();
+                                let rest = (ui.available_width() - origin_w - ui.spacing().item_spacing.x).max(48.0);
                                 ui.allocate_ui_with_layout(Vec2::new(rest, 18.0), Layout::top_down(Align::Min), |ui| {
                                     ui.set_width(rest);
                                     let lab = ui.add(egui::Label::new(text).wrap());
                                     if grey {
-                                        lab.clone().on_hover_text("Not in a ticked mod, and not in Data.");
-                                    }
-                                    if let Some(folder) = folder {
-                                        ui.label(RichText::new(format!("in {folder}")).small().color(WEAK));
+                                        lab.clone().on_hover_text("Not in a mod that is on, the mods folder, or Data.");
                                     }
                                     lab.rect
                                 }).inner
                             };
+                            ui.allocate_ui_with_layout(Vec2::new(origin_w, 18.0), Layout::left_to_right(Align::Center), |ui| {
+                                ui.set_width(origin_w);
+                                let text = origin.map_or_else(|| "—".to_string(), Origin::label);
+                                let shown = if origin.is_some_and(Origin::read) { RichText::new(text).small() } else { RichText::new(text).small().color(WEAK) };
+                                ui.add(egui::Label::new(shown).truncate()).on_hover_text(origin_tip(origin));
+                            });
                             let key = e.name.to_ascii_lowercase();
                             if !present.is_empty() && !present.contains(&key) {
                                 ui.label(RichText::new("missing").small().color(BAD));
@@ -2686,9 +2909,9 @@ impl App {
                 let resp = row.response;
                 let plugin_name = e.name.clone();
                 let plugin_on = e.active;
-                let plugin_folder = self.plugin_home.get(&plugin_name.to_ascii_lowercase()).cloned();
+                let has_origin = origins_now[i].is_some();
                 resp.container_context_menu(|ui| {
-                    Self::plugin_row_menu(ui, &plugin_name, plugin_on, base, i, plugin_folder.clone(), &mut menu);
+                    Self::plugin_row_menu(ui, &plugin_name, plugin_on, base, i, has_origin, &mut menu);
                 });
                 if resp.secondary_clicked() && !base {
                     let key = plugin_name.to_ascii_lowercase();
@@ -2698,7 +2921,7 @@ impl App {
                     }
                 }
                 if !base {
-                    if resp.drag_started_by(egui::PointerButton::Primary) {
+                    if !sorted && resp.drag_started_by(egui::PointerButton::Primary) {
                         self.mods_drag = Some(i);
                     }
                     if resp.clicked() {
@@ -2721,7 +2944,9 @@ impl App {
                         self.mods_dirty = true;
                         toggled = true;
                     }
-                    let _ = resp.clone().on_hover_cursor(egui::CursorIcon::Grab);
+                    if !sorted {
+                        let _ = resp.clone().on_hover_cursor(egui::CursorIcon::Grab);
+                    }
                 }
                 rects.push(resp.rect);
             }
@@ -2733,6 +2958,7 @@ impl App {
                             self.mod_find.clear();
                             self.mod_jump = true;
                         }
+                        open_at = origins_now.get(index).cloned().flatten();
                     }
                     PluginAct::Copy(name) => self.message = Some((format!("Copied {name}."), false)),
                     PluginAct::Selected(on) => {
@@ -2769,7 +2995,7 @@ impl App {
                 let rows: Vec<(String, bool)> = self.mod_rows.iter().map(|r| (r.name.clone(), r.on)).collect();
                 self.clashes = clash_notes(&rows, &self.folder_files);
             }
-            if !find.is_empty() || only_folder.is_some() {
+            if !find.is_empty() || only_folder.is_some() || sorted {
                 return;
             }
             let Some(from) = self.mods_drag else { return };
@@ -2802,6 +3028,9 @@ impl App {
             let e = list.entries.remove(from);
             list.entries.insert(to, e);
             self.mods_dirty = true;
+        }
+        if let Some(origin) = open_at {
+            self.open_origin(&origin);
         }
     }
 
@@ -3702,7 +3931,7 @@ impl App {
         }
     }
 
-    fn plugin_row_menu(ui: &mut egui::Ui, name: &str, on: bool, base: bool, index: usize, folder: Option<String>, act: &mut Option<PluginAct>) {
+    fn plugin_row_menu(ui: &mut egui::Ui, name: &str, on: bool, base: bool, index: usize, has_origin: bool, act: &mut Option<PluginAct>) {
         let _ = on;
         if ui.add_enabled(!base, egui::Button::new("Enable selected")).clicked() {
             *act = Some(PluginAct::Selected(true));
@@ -3720,7 +3949,7 @@ impl App {
             *act = Some(PluginAct::All(false));
             ui.close();
         }
-        if ui.add_enabled(folder.is_some(), egui::Button::new("Open Origin in Explorer")).clicked() {
+        if ui.add_enabled(has_origin, egui::Button::new("Open Origin in Explorer")).on_hover_text("Opens the folder the Origin column names.").clicked() {
             *act = Some(PluginAct::Show(index));
             ui.close();
         }
@@ -6104,6 +6333,98 @@ mod tests {
         let wide_end = format!("{}—", "a".repeat(PREVIEW_CHARS - 1));
         assert_eq!(preview(&wide_end, false), (wide_end.as_str(), false));
         assert_eq!(preview(&long, true), (long.as_str(), true));
+    }
+
+    #[test]
+    fn the_origin_column_asks_the_games_own_lookup() {
+        let root = std::env::temp_dir().join(format!("nvforever-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mods = root.join("mods");
+        let put = |rel: &str| {
+            let path = mods.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        };
+        put("Low/Shared.esp");
+        put("Low/LowOnly.esp");
+        put("High/Shared.esp");
+        put("WithData/Data/meshes/a.nif");
+        put("WithData/Beside.esp");
+        put("Nested/sub/Deep.esp");
+        put("Off/Shared.esp");
+        put("Off/OffOnly.esp");
+        put("Off/InData.esp");
+        put("OffLow/OffOnly.esp");
+        put("Loose.esp");
+        put("Low/Loose.esp");
+        put("High/UPPER.ESM");
+        put("Low/upper.esm");
+        let row = |name: &str, on: bool| ModRow { name: name.into(), on, separator: false, locked: false };
+        let sep = ModRow { name: "Quests".into(), on: false, separator: true, locked: false };
+        // Lowest priority first, as the page keeps them: a lower row wins.
+        let mut rows = vec![row("Low", true), sep, row("High", true), row("WithData", true), row("Nested", true), row("OffLow", false), row("Off", false)];
+        // The page's folder scan (`refresh_plugin_notes`): each folder as plugins_in_tree lists
+        // it, whether it is on or not, and the loose plugins.
+        let listed: HashMap<String, Vec<String>> = rows
+            .iter()
+            .filter(|r| !r.separator)
+            .map(|r| (r.name.clone(), plugins::plugins_in_tree(&mods.join(&r.name)).into_iter().map(|(n, _)| n.to_ascii_lowercase()).collect()))
+            .collect();
+        let loose = loose_plugins(&mods);
+        assert_eq!(loose, HashSet::from(["loose.esp".to_string()]));
+        // The game's own lookup opens every plugin from where the column says, and no other.
+        let same_as_the_game = |rows: &[ModRow]| {
+            let found = plugin_origins(rows, &listed, &loose);
+            let layers: Vec<PathBuf> = rows.iter().filter(|r| r.on && !r.separator).map(|r| plugins::mod_content_root(&mods.join(&r.name))).collect();
+            let game = plugins::layered_plugin_files(&layers, Some(&mods));
+            for (key, path) in &game {
+                let rel = path.strip_prefix(&mods).unwrap();
+                let first = rel.components().next().unwrap().as_os_str().to_string_lossy().into_owned();
+                let want = if rel.components().count() == 1 { Origin::ModsFolder } else { Origin::Mod(first) };
+                assert_eq!(found.get(key), Some(&want), "{key}");
+            }
+            assert_eq!(found.values().filter(|o| o.read()).count(), game.len());
+            found
+        };
+        let found = same_as_the_game(&rows);
+        assert_eq!(found.get("shared.esp"), Some(&Origin::Mod("High".into())), "the highest folder that is on wins, not the off one above it");
+        assert_eq!(found.get("upper.esm"), Some(&Origin::Mod("High".into())), "names match whatever their case");
+        assert_eq!(found.get("lowonly.esp"), Some(&Origin::Mod("Low".into())));
+        assert_eq!(found.get("beside.esp"), Some(&Origin::Mod("WithData".into())), "a plugin beside a mod's Data folder");
+        assert_eq!(found.get("deep.esp"), Some(&Origin::Mod("Nested".into())), "a plugin in a subfolder of a mod");
+        assert_eq!(found.get("loose.esp"), Some(&Origin::Mod("Low".into())), "a mod folder that is on beats the top of the mods folder");
+        assert_eq!(found.get("offonly.esp"), Some(&Origin::Off("Off".into())), "a folder that is off is not a layer; the highest one off is named");
+
+        assert_eq!(origin_of("offonly.esp", &found, false), Some(Origin::Off("Off".into())));
+        assert_eq!(origin_of("indata.esp", &found, true), Some(Origin::Data), "Data comes before a folder that is off");
+        assert_eq!(origin_of("shared.esp", &found, true), Some(Origin::Mod("High".into())), "a layer comes before Data");
+        assert_eq!(origin_of("ghost.esp", &found, true), Some(Origin::Data));
+        assert_eq!(origin_of("ghost.esp", &found, false), None);
+
+        // Turning High off hands Shared.esp to Low; turning Low off too leaves Loose.esp to the top
+        // of the mods folder, and Shared.esp only in folders that are off. Moving Low above High
+        // hands it Shared.esp. The scan is not redone for any of these.
+        rows[2].on = false;
+        assert_eq!(same_as_the_game(&rows).get("shared.esp"), Some(&Origin::Mod("Low".into())));
+        rows[0].on = false;
+        let found = same_as_the_game(&rows);
+        assert_eq!(found.get("loose.esp"), Some(&Origin::ModsFolder));
+        assert_eq!(found.get("shared.esp"), Some(&Origin::Off("Off".into())));
+        let moved = vec![row("High", true), row("Low", true)];
+        assert_eq!(same_as_the_game(&moved).get("shared.esp"), Some(&Origin::Mod("Low".into())));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sorting_by_origin_changes_only_the_view() {
+        let origins = vec![Some(Origin::Data), Some(Origin::Mod("b".into())), None, Some(Origin::Mod("A".into())), Some(Origin::Data), Some(Origin::Off("a".into()))];
+        assert_eq!(plugin_view_order(&origins, PluginSort::Load), [0, 1, 2, 3, 4, 5]);
+        // Case does not matter; the same origin keeps load order; no origin is last either way.
+        assert_eq!(plugin_view_order(&origins, PluginSort::OriginUp), [3, 5, 1, 0, 4, 2]);
+        assert_eq!(plugin_view_order(&origins, PluginSort::OriginDown), [0, 4, 1, 5, 3, 2]);
+        assert_eq!(PluginSort::Load.next().next().next(), PluginSort::Load);
+        assert_eq!(Origin::Off("Armor".into()).label(), "Armor (off)");
+        assert!(!Origin::Off("Armor".into()).read() && Origin::ModsFolder.read() && Origin::Data.read());
     }
 }
 

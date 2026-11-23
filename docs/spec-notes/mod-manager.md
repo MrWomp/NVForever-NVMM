@@ -89,6 +89,41 @@ name order. Folder on/off is not applied on that path
 `--mo2` is not this path. It still only reads another program's instance.
 The launcher does not write that instance.
 
+## The plugin list's Origin column
+
+[design] The Origin column names where the game reads each plugin on a start
+through the launcher. It uses the game's own lookup over the page's mod
+folders that are on, lowest priority first, then `Data`
+[documented: `plugins::layered_plugin_files`, and
+`launcher-mod-visibility.md` "What the game process reads"]:
+
+- the name of the highest-priority mod folder that is on and has the plugin,
+  anywhere in that folder (a plugin beside a mod's `Data` folder counts);
+- `mods folder` for a plugin left loose at the top of the mods folder, outside
+  every mod folder;
+- `Data` for a plugin that only the game's `Data` folder has.
+
+A plugin found only in mod folders that are off shows the highest such folder,
+greyed, with "(off)": the game does not read that copy. A plugin with no file
+in any of these shows a dash [design].
+
+The column follows the page as it is, before **Apply**: turning a folder on or
+off, or moving it, changes the column at once. What each folder holds comes
+from the page's last scan of the mods folder (opening the page, **Refresh**,
+an install, a rename), so turning a folder on or off reads no file. The scan
+lists a folder as the game's lookup does (`plugins::plugins_in_tree`), and a
+test checks the column against `plugins::layered_plugin_files` [design].
+
+Clicking the column's heading sorts the list by origin, A to Z, then Z to A,
+then back to the load order. The sort changes only what is shown: the load
+order and `plugins.txt` stay as they are. A sorted list cannot be dragged
+[design].
+
+**Open Origin in Explorer** on a plugin's menu opens the folder the column
+names with the system's file browser: the mod folder, the mods folder, or the
+game's `Data` folder. Opening a folder writes nothing. Clicking a plugin marks
+the mod its origin names in the mod list [design].
+
 ## A named profile
 
 [documented: docs/spec-notes/launcher-profile.md] **Save** writes
